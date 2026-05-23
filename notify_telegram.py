@@ -120,31 +120,78 @@ def parse_report(report_path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 # Message rendering
 # --------------------------------------------------------------------------- #
+def display_width(s: str) -> int:
+    """计算字符串在等宽字体下的显示宽度。
+
+    CJK/全角字符按 2 列计算,其它(ASCII)按 1 列计算。
+    Telegram 等宽字体下,中文 1 个字 ≈ 英文 2 个字符的宽度。
+    """
+    return sum(2 if ord(c) > 127 else 1 for c in s)
+
+
+def pad_right(s: str, target: int) -> str:
+    """左对齐:在右侧补空格到目标显示宽度。"""
+    return s + " " * max(0, target - display_width(s))
+
+
+def pad_left(s: str, target: int) -> str:
+    """右对齐:在左侧补空格到目标显示宽度。"""
+    return " " * max(0, target - display_width(s)) + s
+
+
 def format_table(rows: list[dict]) -> str:
-    """把行数据格式化为等宽字体下对齐的表格文本。
+    """把行数据格式化为等宽字体下对齐的表格文本(带中文表头)。
 
     输出形如:
-        QCOM    +11.60%   $238.16  Qualcomm
-        F        +9.22%    $14.93  Ford
+        代码    涨跌幅      现价  公司
+        QCOM   +11.60%  $238.16  Qualcomm
+        F       +9.22%   $14.93  Ford
     """
     if not rows:
         return ""
 
-    # 计算各列实际最大宽度,保证对齐
-    max_ticker = max(len(r["ticker"]) for r in rows)
-    max_pct = max(len(r["pct"]) for r in rows)
-    max_price = max(len(r["price"]) for r in rows)
+    headers = {
+        "ticker": "代码",
+        "pct": "涨跌幅",
+        "price": "现价",
+        "name": "公司",
+    }
 
-    out_lines = []
-    for r in rows:
-        line = (
-            f"{r['ticker']:<{max_ticker}}  "
-            f"{r['pct']:>{max_pct}}  "
-            f"{r['price']:>{max_price}}  "
-            f"{r['name']}"
+    # 列宽 = max(表头宽度, 该列所有数据宽度),保证表头和数据都不被截断
+    w_ticker = max(
+        display_width(headers["ticker"]),
+        max(display_width(r["ticker"]) for r in rows),
+    )
+    w_pct = max(
+        display_width(headers["pct"]),
+        max(display_width(r["pct"]) for r in rows),
+    )
+    w_price = max(
+        display_width(headers["price"]),
+        max(display_width(r["price"]) for r in rows),
+    )
+
+    def render(t: str, p: str, pr: str, n: str, num_align_right: bool = True) -> str:
+        align_pct = pad_left if num_align_right else pad_right
+        align_price = pad_left if num_align_right else pad_right
+        return (
+            f"{pad_right(t, w_ticker)}  "
+            f"{align_pct(p, w_pct)}  "
+            f"{align_price(pr, w_price)}  "
+            f"{n}"
         )
-        out_lines.append(line)
-    return "\n".join(out_lines)
+
+    lines = [
+        render(
+            headers["ticker"],
+            headers["pct"],
+            headers["price"],
+            headers["name"],
+        ),
+    ]
+    for r in rows:
+        lines.append(render(r["ticker"], r["pct"], r["price"], r["name"]))
+    return "\n".join(lines)
 
 
 def build_message(report_path: Path, repo_url: str) -> str:
