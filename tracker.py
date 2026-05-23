@@ -1,4 +1,4 @@
-"""人形机器人产业链行情追踪器。
+"""美股 AI 全产业链行情追踪器。
 
 抓取每只 ticker 的实时价格、涨跌幅、市值、PE、52 周区间,
 并生成:
@@ -45,7 +45,8 @@ console = Console()
 class TickerSnapshot:
     symbol: str
     name: str
-    category: str
+    category: str            # 子分类(细分赛道)
+    super_category: str      # 大模块(上 / 中 / 下游)
     description: str
     price: Optional[float] = None
     change_pct: Optional[float] = None
@@ -61,10 +62,16 @@ class TickerSnapshot:
 # --------------------------------------------------------------------------- #
 # Fetch
 # --------------------------------------------------------------------------- #
-def fetch_one(symbol: str, description: str, category: str) -> TickerSnapshot:
+def fetch_one(
+    symbol: str, description: str, category: str, super_category: str
+) -> TickerSnapshot:
     """抓取单只标的的快照。失败时把异常记录到 snapshot.error。"""
     snap = TickerSnapshot(
-        symbol=symbol, name=symbol, category=category, description=description
+        symbol=symbol,
+        name=symbol,
+        category=category,
+        super_category=super_category,
+        description=description,
     )
     try:
         t = yf.Ticker(symbol)
@@ -95,7 +102,7 @@ def fetch_one(symbol: str, description: str, category: str) -> TickerSnapshot:
         # 仍然没有价格 → 标记为失败(常见于已退市/低流动性 OTC)
         if snap.price is None:
             snap.error = "no price data (delisted or illiquid)"
-    except Exception as e:  # noqa: BLE001  -- 想要捕获所有错误
+    except Exception as e:  # noqa: BLE001
         snap.error = f"{type(e).__name__}: {e}"
     return snap
 
@@ -114,16 +121,26 @@ def fetch_all(max_workers: int = 10) -> list[TickerSnapshot]:
         task = progress.add_task("fetch", total=len(items))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(fetch_one, sym, desc, cat): sym
-                for sym, desc, cat in items
+                ex.submit(fetch_one, sym, desc, sub_cat, super_cat): sym
+                for sym, desc, sub_cat, super_cat in items
             }
             for fut in as_completed(futures):
                 snaps.append(fut.result())
                 progress.update(task, advance=1)
 
-    # 按原始分类顺序 + ticker 字母排序
-    cat_order = {c: i for i, c in enumerate(TICKERS)}
-    snaps.sort(key=lambda s: (cat_order.get(s.category, 99), s.symbol))
+    # 按嵌套分类原始顺序 + ticker 字母排序
+    super_order: dict[str, int] = {c: i for i, c in enumerate(TICKERS)}
+    sub_order: dict[str, int] = {}
+    for i, super_cat in enumerate(TICKERS):
+        for j, sub_cat in enumerate(TICKERS[super_cat]):
+            sub_order[(super_cat, sub_cat)] = i * 100 + j  # type: ignore
+
+    def sort_key(s: TickerSnapshot) -> tuple:
+        sup = super_order.get(s.super_category, 99)
+        sub = sub_order.get((s.super_category, s.category), 99)
+        return (sup, sub, s.symbol)
+
+    snaps.sort(key=sort_key)
     return snaps
 
 
@@ -167,47 +184,53 @@ def fmt_range(low: Optional[float], high: Optional[float]) -> str:
 # Render to terminal
 # --------------------------------------------------------------------------- #
 def render_table(snaps: list[TickerSnapshot]) -> None:
-    by_cat: dict[str, list[TickerSnapshot]] = {}
+    by_super: dict[str, dict[str, list[TickerSnapshot]]] = {}
     for s in snaps:
-        by_cat.setdefault(s.category, []).append(s)
+        by_super.setdefault(s.super_category, {}).setdefault(s.category, []).append(s)
 
-    for cat, group in by_cat.items():
-        table = Table(title=cat, header_style="bold cyan", title_style="bold yellow")
-        table.add_column("Ticker", style="bold")
-        table.add_column("公司")
-        table.add_column("Price", justify="right")
-        table.add_column("Δ%", justify="right")
-        table.add_column("Mkt Cap", justify="right")
-        table.add_column("P/E", justify="right")
-        table.add_column("Fwd P/E", justify="right")
-        table.add_column("52W Range", justify="right")
+    for super_cat, sub_cats in by_super.items():
+        console.print(f"\n[bold magenta on white] {super_cat} [/bold magenta on white]")
+        for sub_cat, group in sub_cats.items():
+            table = Table(
+                title=sub_cat,
+                header_style="bold cyan",
+                title_style="bold yellow",
+            )
+            table.add_column("Ticker", style="bold")
+            table.add_column("公司")
+            table.add_column("Price", justify="right")
+            table.add_column("Δ%", justify="right")
+            table.add_column("Mkt Cap", justify="right")
+            table.add_column("P/E", justify="right")
+            table.add_column("Fwd P/E", justify="right")
+            table.add_column("52W Range", justify="right")
 
-        for s in group:
-            if s.error:
+            for s in group:
+                if s.error:
+                    table.add_row(
+                        s.symbol,
+                        s.description[:40],
+                        "[red]ERROR[/red]",
+                        "",
+                        "",
+                        "",
+                        "",
+                        s.error[:30],
+                    )
+                    continue
+                color = "green" if (s.change_pct or 0) >= 0 else "red"
+                change_str = f"[{color}]{fmt_pct(s.change_pct)}[/{color}]"
                 table.add_row(
                     s.symbol,
                     s.description[:40],
-                    "[red]ERROR[/red]",
-                    "",
-                    "",
-                    "",
-                    "",
-                    s.error[:30],
+                    fmt_price(s.price),
+                    change_str,
+                    fmt_market_cap(s.market_cap),
+                    fmt_pe(s.pe_ratio),
+                    fmt_pe(s.forward_pe),
+                    fmt_range(s.fifty_two_week_low, s.fifty_two_week_high),
                 )
-                continue
-            color = "green" if (s.change_pct or 0) >= 0 else "red"
-            change_str = f"[{color}]{fmt_pct(s.change_pct)}[/{color}]"
-            table.add_row(
-                s.symbol,
-                s.description[:40],
-                fmt_price(s.price),
-                change_str,
-                fmt_market_cap(s.market_cap),
-                fmt_pe(s.pe_ratio),
-                fmt_pe(s.forward_pe),
-                fmt_range(s.fifty_two_week_low, s.fifty_two_week_high),
-            )
-        console.print(table)
+            console.print(table)
         console.print()
 
 
@@ -217,7 +240,7 @@ def render_table(snaps: list[TickerSnapshot]) -> None:
 def write_markdown(snaps: list[TickerSnapshot], out_path: Path) -> None:
     now = datetime.now()
     lines: list[str] = [
-        f"# 人形机器人产业链日报 — {now.strftime('%Y-%m-%d %H:%M')}",
+        f"# 美股 AI 全产业链日报 — {now.strftime('%Y-%m-%d %H:%M')}",
         "",
         "> 数据来源:Yahoo Finance (yfinance)。仅供参考,不构成投资建议。",
         "",
@@ -254,37 +277,41 @@ def write_markdown(snaps: list[TickerSnapshot], out_path: Path) -> None:
             )
         lines.append("")
 
-    by_cat: dict[str, list[TickerSnapshot]] = {}
+    # 按 (super_category, category) 嵌套分组
+    by_super: dict[str, dict[str, list[TickerSnapshot]]] = {}
     for s in snaps:
-        by_cat.setdefault(s.category, []).append(s)
+        by_super.setdefault(s.super_category, {}).setdefault(s.category, []).append(s)
 
-    for cat, group in by_cat.items():
-        lines += [
-            f"## {cat}",
-            "",
-            "| Ticker | 公司 | 现价 | 涨跌幅 | 市值 | P/E (TTM) | Fwd P/E | 52周区间 |",
-            "|---|---|---|---|---|---|---|---|",
-        ]
-        for s in group:
-            if s.error:
+    for super_cat, sub_cats in by_super.items():
+        lines += [f"## {super_cat}", ""]
+        for sub_cat, group in sub_cats.items():
+            lines += [
+                f"### {sub_cat}",
+                "",
+                "| Ticker | 公司 | 现价 | 涨跌幅 | 市值 | P/E (TTM) | Fwd P/E | 52周区间 |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+            for s in group:
+                if s.error:
+                    lines.append(
+                        f"| {s.symbol} | {s.description} | — | — | — | — | — | error |"
+                    )
+                    continue
                 lines.append(
-                    f"| {s.symbol} | {s.description} | — | — | — | — | — | error |"
+                    f"| **{s.symbol}** | {s.description} | "
+                    f"{fmt_price(s.price)} | {fmt_pct(s.change_pct)} | "
+                    f"{fmt_market_cap(s.market_cap)} | "
+                    f"{fmt_pe(s.pe_ratio)} | {fmt_pe(s.forward_pe)} | "
+                    f"{fmt_range(s.fifty_two_week_low, s.fifty_two_week_high)} |"
                 )
-                continue
-            lines.append(
-                f"| **{s.symbol}** | {s.description} | "
-                f"{fmt_price(s.price)} | {fmt_pct(s.change_pct)} | "
-                f"{fmt_market_cap(s.market_cap)} | "
-                f"{fmt_pe(s.pe_ratio)} | {fmt_pe(s.forward_pe)} | "
-                f"{fmt_range(s.fifty_two_week_low, s.fifty_two_week_high)} |"
-            )
-        lines.append("")
+            lines.append("")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def write_csv(snaps: list[TickerSnapshot], out_path: Path) -> None:
     fields = [
+        "super_category",
         "category",
         "symbol",
         "name",
@@ -312,7 +339,7 @@ def write_csv(snaps: list[TickerSnapshot], out_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="人形机器人产业链行情追踪器"
+        description="美股 AI 全产业链行情追踪器"
     )
     parser.add_argument(
         "--out", default="reports", help="输出目录(默认 ./reports)"

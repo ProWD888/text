@@ -1,0 +1,68 @@
+name: 美股 AI 全产业链日报
+
+# 触发方式
+on:
+  # 关键代码变更时自动跑一次,顺带让 GitHub 第一时间注册这个工作流
+  push:
+    branches: [main]
+    paths:
+      - "tracker.py"
+      - "tickers.py"
+      - "requirements.txt"
+      - "notify_telegram.py"
+      - ".github/workflows/daily-report.yml"
+  schedule:
+    # 每个交易日(周一~周五)美东时间下午 5 点跑一次
+    # = UTC 时间 21:00(美东 EST)/ 22:00(美东 EDT)
+    - cron: "0 21 * * 1-5"
+  workflow_dispatch: {}   # 允许手动一键触发
+
+permissions:
+  contents: write   # 允许 Action 把日报提交回仓库
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 抓取数据并生成日报
+        run: python tracker.py --no-table
+
+      - name: 推送到 Telegram(如果配置了 secrets)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python notify_telegram.py
+
+      - name: 输出日报摘要到 Action 日志
+        run: |
+          REPORT=$(ls -t reports/*.md | head -1)
+          if [ -n "$REPORT" ]; then
+            echo "## 📊 今日日报预览" >> $GITHUB_STEP_SUMMARY
+            head -60 "$REPORT" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 提交日报到仓库
+        env:
+          TZ: America/New_York
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          if git diff --staged --quiet; then
+            echo "今日无新数据,跳过提交。"
+          else
+            git commit -m "chore: 自动生成日报 $(date +%Y-%m-%d)"
+            git push
+          fi
