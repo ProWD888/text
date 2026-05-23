@@ -2,6 +2,14 @@ name: 每日人形机器人股票日报
 
 # 触发方式
 on:
+  # 关键代码变更时自动跑一次,顺带让 GitHub 第一时间注册这个工作流
+  push:
+    branches: [main]
+    paths:
+      - "tracker.py"
+      - "tickers.py"
+      - "requirements.txt"
+      - ".github/workflows/daily-report.yml"
   schedule:
     # 每个交易日(周一~周五)美东时间下午 5 点跑一次
     # = UTC 时间 21:00(美东 EST)/ 22:00(美东 EDT)
