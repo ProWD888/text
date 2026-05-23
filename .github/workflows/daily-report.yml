@@ -1,4 +1,4 @@
-name: 每日人形机器人股票日报
+name: 美股 AI 全产业链日报
 
 # 触发方式
 on:
@@ -50,7 +50,7 @@ jobs:
           REPORT=$(ls -t reports/*.md | head -1)
           if [ -n "$REPORT" ]; then
             echo "## 📊 今日日报预览" >> $GITHUB_STEP_SUMMARY
-            head -40 "$REPORT" >> $GITHUB_STEP_SUMMARY
+            head -60 "$REPORT" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: 提交日报到仓库

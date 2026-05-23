@@ -1,31 +1,34 @@
-"""把今日日报摘要推送到 Telegram(等宽字体表格版)。
+"""把今日全产业链日报推送到 Telegram(多条消息,按大模块切分)。
 
 环境变量:
   TELEGRAM_BOT_TOKEN  必填,@BotFather 给的 token
   TELEGRAM_CHAT_ID    必填,你的 chat_id(私聊或群组)
   GITHUB_REPOSITORY   选填,GitHub Actions 自动注入,用于生成"查看完整日报"链接
 
-只发送日报标题 + Top 5 涨幅榜 + Top 5 跌幅榜,
-正文超过 4000 字符会自动截断(Telegram 上限 4096)。
+推送策略:
+  1. 第 1 条:标题 + 今日 Top 5 涨幅 + 今日 Top 5 跌幅
+  2. 之后每个大模块(上 / 中 / 下游)各发一条,内部再按子分类分块
+  3. 每条消息严格控制在 4096 字符以内(Telegram 上限)
 
-排版策略:
-  使用 <pre> 标签包裹表格,Telegram 客户端会用等宽字体渲染,
-  ticker / 涨跌幅 / 价格三列严格对齐,扫一眼就能读懂。
-  公司名只取破折号前的主名(如 "Qualcomm — RB6/RB7 机器人平台" → "Qualcomm")。
-  最上方有一行中文表头(代码 / 涨跌幅 / 现价 / 公司),用 display_width
-  正确处理中文字符占 2 列的对齐。
+每张表 5 列:代码 / 涨跌幅 / 现价 / 公司 / 看点,
+用 <pre> 等宽字体渲染,中文按 2 列宽度对齐。
+数据来源是 reports/YYYY-MM-DD.csv,公司中文名和"看点"从 tickers.py 反查。
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+from tickers import lookup_meta
 
 
 # --------------------------------------------------------------------------- #
@@ -53,178 +56,19 @@ def html_escape(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Markdown report parsing
+# Report parsing
 # --------------------------------------------------------------------------- #
-def short_name(desc: str, max_len: int = 18) -> str:
-    """把 'Qualcomm — RB6/RB7 机器人平台' 简化为 'Qualcomm'。"""
-    for sep in ["—", "–", " - "]:
-        if sep in desc:
-            desc = desc.split(sep)[0]
-            break
-    return desc.strip()[:max_len]
+def find_latest_csv() -> Path | None:
+    """优先取今日 CSV,否则取目录里最新的一份。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_path = Path("reports") / f"{today}.csv"
+    if today_path.exists():
+        return today_path
+    candidates = sorted(Path("reports").glob("*.csv"))
+    return candidates[-1] if candidates else None
 
 
-def parse_report(report_path: Path) -> dict:
-    """从 Markdown 日报中提取:title, date, gainers, losers。"""
-    text = report_path.read_text(encoding="utf-8")
-    lines = text.split("\n")
-
-    title = ""
-    date_str = ""
-    gainers: list[dict] = []
-    losers: list[dict] = []
-    current: list[dict] | None = None
-
-    for ln in lines:
-        if ln.startswith("# "):
-            full_title = ln[2:].strip()
-            # 标题里通常带日期: "人形机器人产业链日报 — 2026-05-23 10:57"
-            m = re.match(r"^(.*?)\s*[—–-]\s*(\d{4}-\d{2}-\d{2}.*)$", full_title)
-            if m:
-                title = m.group(1).strip()
-                date_str = m.group(2).strip()
-            else:
-                title = full_title
-        elif ln.startswith("## 今日 Top") and "涨" in ln:
-            current = gainers
-        elif ln.startswith("## 今日 Top") and "跌" in ln:
-            current = losers
-        elif ln.startswith("## "):
-            current = None
-        elif (
-            current is not None
-            and ln.startswith("|")
-            and not ln.startswith("|---")
-            and "Ticker" not in ln
-        ):
-            cells = [
-                c.strip().replace("**", "")
-                for c in ln.strip().strip("|").split("|")
-            ]
-            if len(cells) >= 4 and cells[0]:
-                current.append(
-                    {
-                        "ticker": cells[0],
-                        "name": short_name(cells[1]),
-                        "pct": cells[2],
-                        "price": cells[3],
-                    }
-                )
-
-    return {
-        "title": title,
-        "date": date_str,
-        "gainers": gainers,
-        "losers": losers,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Message rendering
-# --------------------------------------------------------------------------- #
-def display_width(s: str) -> int:
-    """计算字符串在等宽字体下的显示宽度。
-
-    CJK/全角字符按 2 列计算,其它(ASCII)按 1 列计算。
-    Telegram 等宽字体下,中文 1 个字 ≈ 英文 2 个字符的宽度。
-    """
-    return sum(2 if ord(c) > 127 else 1 for c in s)
-
-
-def pad_right(s: str, target: int) -> str:
-    """左对齐:在右侧补空格到目标显示宽度。"""
-    return s + " " * max(0, target - display_width(s))
-
-
-def pad_left(s: str, target: int) -> str:
-    """右对齐:在左侧补空格到目标显示宽度。"""
-    return " " * max(0, target - display_width(s)) + s
-
-
-def format_table(rows: list[dict]) -> str:
-    """把行数据格式化为等宽字体下对齐的表格文本(带中文表头)。
-
-    输出形如:
-        代码    涨跌幅     现价  公司
-        QCOM   +11.60%  $238.16  Qualcomm
-        F       +9.22%   $14.93  Ford
-    """
-    if not rows:
-        return ""
-
-    headers = {
-        "ticker": "代码",
-        "pct": "涨跌幅",
-        "price": "现价",
-        "name": "公司",
-    }
-
-    # 列宽 = max(表头宽度, 该列所有数据宽度),保证表头和数据都不被截断
-    w_ticker = max(
-        display_width(headers["ticker"]),
-        max(display_width(r["ticker"]) for r in rows),
-    )
-    w_pct = max(
-        display_width(headers["pct"]),
-        max(display_width(r["pct"]) for r in rows),
-    )
-    w_price = max(
-        display_width(headers["price"]),
-        max(display_width(r["price"]) for r in rows),
-    )
-
-    def render(t: str, p: str, pr: str, n: str) -> str:
-        return (
-            f"{pad_right(t, w_ticker)}  "
-            f"{pad_left(p, w_pct)}  "
-            f"{pad_left(pr, w_price)}  "
-            f"{n}"
-        )
-
-    lines = [
-        render(
-            headers["ticker"],
-            headers["pct"],
-            headers["price"],
-            headers["name"],
-        ),
-    ]
-    for r in rows:
-        lines.append(render(r["ticker"], r["pct"], r["price"], r["name"]))
-    return "\n".join(lines)
-
-
-def build_message(report_path: Path, repo_url: str) -> str:
-    """构造完整 Telegram HTML 消息。"""
-    data = parse_report(report_path)
-    title = data["title"] or "美股日报"
-    date_str = data["date"]
-
-    parts: list[str] = []
-    parts.append(f"📊 <b>{html_escape(title)}</b>")
-    if date_str:
-        parts.append(f"📅 {html_escape(date_str)}")
-    parts.append("")
-
-    if data["gainers"]:
-        parts.append("📈 <b>今日 Top 5 涨幅</b>")
-        table = format_table(data["gainers"])
-        parts.append(f"<pre>{html_escape(table)}</pre>")
-
-    if data["losers"]:
-        parts.append("📉 <b>今日 Top 5 跌幅</b>")
-        table = format_table(data["losers"])
-        parts.append(f"<pre>{html_escape(table)}</pre>")
-
-    parts.append(f"🔗 <a href=\"{repo_url}\">查看完整日报</a>")
-    return "\n".join(parts)
-
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-def find_latest_report() -> Path | None:
-    """优先取今日报告,否则取目录里最新的一份。"""
+def find_latest_md() -> Path | None:
     today = datetime.now().strftime("%Y-%m-%d")
     today_path = Path("reports") / f"{today}.md"
     if today_path.exists():
@@ -233,9 +77,239 @@ def find_latest_report() -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def parse_csv(csv_path: Path) -> list[dict]:
+    """读 CSV,补全 (中文名, 看点),只保留有价格的行。"""
+    rows: list[dict] = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            if r.get("error") or not r.get("price"):
+                continue
+            symbol = r["symbol"]
+            meta = lookup_meta(symbol)
+            if meta is None:
+                continue
+            name_cn, takeaway, sub_cat, super_cat = meta
+            try:
+                price = float(r["price"])
+                pct = float(r["change_pct"]) if r.get("change_pct") else None
+            except (ValueError, KeyError):
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": name_cn,
+                    "takeaway": takeaway,
+                    "sub_category": sub_cat,
+                    "super_category": super_cat,
+                    "price": price,
+                    "pct": pct,
+                }
+            )
+    return rows
+
+
+def parse_md_title(md_path: Path) -> tuple[str, str]:
+    """从 Markdown 第一行抽取标题 + 日期。"""
+    text = md_path.read_text(encoding="utf-8")
+    first_line = text.splitlines()[0] if text else ""
+    m = re.match(
+        r"^#\s*(.*?)\s*[—–-]\s*(\d{4}-\d{2}-\d{2}.*)$", first_line.strip()
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return first_line.lstrip("#").strip() or "美股 AI 全产业链日报", ""
+
+
+# --------------------------------------------------------------------------- #
+# Width-aware padding (CJK = 2 cols)
+# --------------------------------------------------------------------------- #
+def display_width(s: str) -> int:
+    """CJK/全角字符按 2 列计算,其它按 1 列。"""
+    return sum(2 if ord(c) > 127 else 1 for c in s)
+
+
+def pad_right(s: str, target: int) -> str:
+    return s + " " * max(0, target - display_width(s))
+
+
+def pad_left(s: str, target: int) -> str:
+    return " " * max(0, target - display_width(s)) + s
+
+
+def truncate_to_width(s: str, max_w: int) -> str:
+    """按显示宽度截断字符串,超出加 …"""
+    if display_width(s) <= max_w:
+        return s
+    out = ""
+    cur = 0
+    for c in s:
+        w = 2 if ord(c) > 127 else 1
+        if cur + w > max_w - 1:
+            break
+        out += c
+        cur += w
+    return out + "…"
+
+
+# --------------------------------------------------------------------------- #
+# Formatting
+# --------------------------------------------------------------------------- #
+def fmt_pct(p: float | None) -> str:
+    if p is None:
+        return "—"
+    sign = "+" if p >= 0 else ""
+    return f"{sign}{p:.2f}%"
+
+
+def fmt_price(p: float | None) -> str:
+    if p is None:
+        return "—"
+    if p >= 1000:
+        return f"${p:,.0f}"
+    return f"${p:.2f}"
+
+
+def format_table(rows: list[dict], with_takeaway: bool = True) -> str:
+    """渲染等宽对齐表格。
+
+    列: 代码 / 涨跌幅 / 现价 / 公司 [/ 看点]
+    """
+    if not rows:
+        return ""
+
+    items = [
+        {
+            "ticker": r["symbol"],
+            "pct": fmt_pct(r["pct"]),
+            "price": fmt_price(r["price"]),
+            "name": r["name"],
+            "takeaway": truncate_to_width(r.get("takeaway", ""), 26),
+        }
+        for r in rows
+    ]
+
+    headers = {
+        "ticker": "代码",
+        "pct": "涨跌幅",
+        "price": "现价",
+        "name": "公司",
+        "takeaway": "看点",
+    }
+
+    cols = ["ticker", "pct", "price", "name"] + (["takeaway"] if with_takeaway else [])
+    widths = {
+        c: max(display_width(headers[c]), max(display_width(it[c]) for it in items))
+        for c in cols
+    }
+
+    def render_row(values: dict) -> str:
+        parts = []
+        for c in cols:
+            if c in ("pct", "price"):
+                parts.append(pad_left(values[c], widths[c]))
+            else:
+                parts.append(pad_right(values[c], widths[c]))
+        return "  ".join(parts).rstrip()
+
+    out = [render_row(headers)]
+    for it in items:
+        out.append(render_row(it))
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Top 5 from full report
+# --------------------------------------------------------------------------- #
+def build_top_message(rows: list[dict], title: str, date_str: str, repo_url: str) -> str:
+    valid = [r for r in rows if r["pct"] is not None]
+    gainers = sorted(valid, key=lambda r: r["pct"], reverse=True)[:5]
+    losers = sorted(valid, key=lambda r: r["pct"])[:5]
+
+    parts: list[str] = []
+    parts.append(f"📊 <b>{html_escape(title)}</b>")
+    if date_str:
+        parts.append(f"📅 {html_escape(date_str)}")
+    parts.append("")
+
+    if gainers:
+        parts.append("📈 <b>今日 Top 5 涨幅</b>")
+        parts.append(f"<pre>{html_escape(format_table(gainers))}</pre>")
+
+    if losers:
+        parts.append("📉 <b>今日 Top 5 跌幅</b>")
+        parts.append(f"<pre>{html_escape(format_table(losers))}</pre>")
+
+    parts.append(f"🔗 <a href=\"{repo_url}\">查看完整日报</a>")
+    return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Per super-category messages
+# --------------------------------------------------------------------------- #
+SUPER_EMOJI = {
+    "上游 · 基础设施 / 硬件": "🔹",
+    "中游 · 云算力 / 平台 / 模型": "🔸",
+    "下游 · 应用层": "🔷",
+}
+
+
+def build_super_message(super_cat: str, rows: list[dict]) -> str:
+    """构造单个大模块的消息。
+
+    内部按 sub_category 分块,每块一张 5 列表格。
+    每条控制在 4000 字符内,超过会拆成多条返回(用 <<<SPLIT>>> 分隔)。
+    """
+    emoji = SUPER_EMOJI.get(super_cat, "📦")
+    by_sub: dict[str, list[dict]] = {}
+    for r in rows:
+        by_sub.setdefault(r["sub_category"], []).append(r)
+
+    header = f"{emoji} <b>{html_escape(super_cat)}</b>"
+    parts: list[str] = [header]
+
+    for sub_cat, group in by_sub.items():
+        sub_block = [
+            "",
+            f"▸ <b>{html_escape(sub_cat)}</b>",
+            f"<pre>{html_escape(format_table(group))}</pre>",
+        ]
+        candidate = "\n".join(parts + sub_block)
+        if len(candidate) > 3900 and len(parts) > 1:
+            parts.append("\n<<<SPLIT>>>")
+            parts.append(header + " (续)")
+        parts.extend(sub_block)
+
+    return "\n".join(parts)
+
+
+def split_into_messages(big_msg: str) -> list[str]:
+    """按 <<<SPLIT>>> 标记切成多条消息。"""
+    if "<<<SPLIT>>>" not in big_msg:
+        return [big_msg]
+    chunks = big_msg.split("\n<<<SPLIT>>>\n")
+    return [c.strip() for c in chunks if c.strip()]
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def safe_send(token: str, chat_id: str, msg: str, label: str) -> bool:
+    """发送一条消息,处理截断和异常。"""
+    if len(msg) > 4096:
+        msg = msg[:4040] + "\n…(已截断)"
+    try:
+        result = send_telegram(token, chat_id, msg)
+    except Exception as e:  # noqa: BLE001
+        print(f"✗ {label} 推送失败: {type(e).__name__}: {e}")
+        return False
+    if result.get("ok"):
+        print(f"✓ {label} 推送成功 (message_id={result['result']['message_id']})")
+        return True
+    print(f"✗ {label} 返回错误: {result}")
+    return False
+
+
 def main() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -244,30 +318,46 @@ def main() -> int:
         print("⚠ TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未配置,跳过推送。")
         return 0
 
-    report = find_latest_report()
-    if report is None:
-        print("⚠ 找不到任何日报文件,跳过推送。")
+    csv_path = find_latest_csv()
+    md_path = find_latest_md()
+    if csv_path is None or md_path is None:
+        print("⚠ 找不到 CSV 或 Markdown 日报,跳过推送。")
         return 0
 
     repo = os.environ.get("GITHUB_REPOSITORY", "ProWD888/text")
-    repo_url = f"https://github.com/{repo}/blob/main/{report.as_posix()}"
+    repo_url = f"https://github.com/{repo}/blob/main/{md_path.as_posix()}"
 
-    msg = build_message(report, repo_url)
-    if len(msg) > 4000:
-        msg = msg[:3950] + "\n…(已截断,完整内容点链接)"
-
-    try:
-        result = send_telegram(token, chat_id, msg)
-    except Exception as e:  # noqa: BLE001
-        print(f"✗ Telegram 推送失败: {type(e).__name__}: {e}")
-        return 1
-
-    if result.get("ok"):
-        msg_id = result["result"]["message_id"]
-        print(f"✓ Telegram 已推送,message_id={msg_id}")
+    rows = parse_csv(csv_path)
+    if not rows:
+        print("⚠ CSV 中没有有效数据,跳过推送。")
         return 0
-    print(f"✗ Telegram 返回错误: {result}")
-    return 1
+
+    title, date_str = parse_md_title(md_path)
+
+    # 1. Top 5 概览
+    overview = build_top_message(rows, title, date_str, repo_url)
+    safe_send(token, chat_id, overview, "概览")
+    time.sleep(1)  # 避免 Telegram 反垃圾
+
+    # 2. 每个大模块各发一条(可能拆多条)
+    by_super: dict[str, list[dict]] = {}
+    for r in rows:
+        by_super.setdefault(r["super_category"], []).append(r)
+
+    sent_count = 1
+    fail_count = 0
+    for super_cat, group in by_super.items():
+        big = build_super_message(super_cat, group)
+        for sub_msg in split_into_messages(big):
+            ok = safe_send(token, chat_id, sub_msg, super_cat)
+            if ok:
+                sent_count += 1
+            else:
+                fail_count += 1
+            time.sleep(1)
+
+    print(f"\n📊 总结: 共发送 {sent_count} 条,失败 {fail_count} 条")
+    return 0 if fail_count == 0 else 1
 
 
 if __name__ == "__main__":
