@@ -6,9 +6,6 @@ __pycache__/
 venv/
 env/
 
-# Reports output
-reports/
-
 # IDE / OS
 .vscode/
 .idea/
