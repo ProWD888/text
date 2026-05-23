@@ -29,7 +29,17 @@ jobs:
       - name: 抓取数据并生成日报
         run: python tracker.py --no-table
 
+      - name: 输出日报摘要到 Action 日志
+        run: |
+          REPORT=$(ls -t reports/*.md | head -1)
+          if [ -n "$REPORT" ]; then
+            echo "## 📊 今日日报预览" >> $GITHUB_STEP_SUMMARY
+            head -40 "$REPORT" >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: 提交日报到仓库
+        env:
+          TZ: America/New_York
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -37,6 +47,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "今日无新数据,跳过提交。"
           else
-            git commit -m "chore: 自动生成日报 $(date -u +%Y-%m-%d)"
+            git commit -m "chore: 自动生成日报 $(date +%Y-%m-%d)"
             git push
           fi
