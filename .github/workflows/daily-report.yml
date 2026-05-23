@@ -9,6 +9,7 @@ on:
       - "tracker.py"
       - "tickers.py"
       - "requirements.txt"
+      - "notify_telegram.py"
       - ".github/workflows/daily-report.yml"
   schedule:
     # 每个交易日(周一~周五)美东时间下午 5 点跑一次
