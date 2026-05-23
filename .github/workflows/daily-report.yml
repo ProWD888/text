@@ -29,6 +29,13 @@ jobs:
       - name: 抓取数据并生成日报
         run: python tracker.py --no-table
 
+      - name: 推送到 Telegram(如果配置了 secrets)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python notify_telegram.py
+
       - name: 输出日报摘要到 Action 日志
         run: |
           REPORT=$(ls -t reports/*.md | head -1)
